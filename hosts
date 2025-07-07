@@ -1,6 +1,5 @@
 [masternode]
-k3s-master
+raspberrypi4
 
 [workers]
-worker01
-worker02
+# No workers needed for single node setup

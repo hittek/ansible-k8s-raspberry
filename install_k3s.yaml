@@ -1,86 +1,150 @@
 ---
-  - name: Check cgroup configuration on all nodes
-    hosts: all
-    gather_facts: true
+- name: Ensure cgroup configuration on all Raspberry Pi nodes
+  hosts: all
+  gather_facts: true
+  become: true
 
-    tasks:
-      - name: Check if cgroup config is existing or not
-        shell: grep -o "cgroup_memory=1 cgroup_enable=memory" /boot/cmdline.txt
-        register: out
-        failed_when: false
-        changed_when: false
+  vars:
+    cgroup_params: "cgroup_enable=cpuset cgroup_memory=1 cgroup_enable=memory"
 
-      - name: Execute if not existing
-        shell: |
-                cp /boot/cmdline.txt /boot/cmdline.txt.backup.%date
-                sed -i 's/$/ cgroup_memory=1 cgroup_enable=memory/g' /boot/cmdline.txt 
-                sleep 5 && shutdown -r now "Ansible Rebooting after cgroup configuration"
-        when: "'cgroup_memory=1 cgroup_enable=memory' not in out.stdout"
-        async: 0
-        poll: 0
-        ignore_unreachable: true
-        become: true
-        become_method: sudo
-      
-      - name: Waiting for server to come back
-        wait_for_connection:
-          delay: 5
+  tasks:
+    - name: Ensure /boot/firmware/cmdline.txt exists
+      stat:
+        path: /boot/firmware/cmdline.txt
+      register: firmware_cmdline
 
-  - name: Master Node Configuration
-    hosts: masternode
-    gather_facts: no
-    
-    tasks: 
-      - name: Check if 10250 is Opened 
-        wait_for:
-          port: 10250
-          delay: 5
-          timeout: 10
-          msg: "10250 is not open"
-        register: port_check
-        ignore_errors: yes
+    - name: Fail if /boot/firmware/cmdline.txt does not exist
+      fail:
+        msg: "/boot/firmware/cmdline.txt not found. Please ensure your OS uses this file for kernel parameters."
+      when: not firmware_cmdline.stat.exists
 
-      - name: Open port 10250 in iptables
-        shell: iptables -A INPUT -p tcp --dport 10250 -j ACCEPT
-        when: port_check.failed == true
-        become: true
-        become_method: sudo
+    - name: Backup current cmdline.txt
+      copy:
+        src: /boot/firmware/cmdline.txt
+        dest: "/boot/firmware/cmdline.txt.backup.{{ ansible_date_time.iso8601_basic_short }}"
+        remote_src: yes
 
-      - name: Print message if 10250 is Already Opened 
-        debug:
-          msg: "10250 is already Opened"
-        when: port_check.failed == false
+    - name: Remove cgroup_disable=memory from cmdline.txt
+      replace:
+        path: /boot/firmware/cmdline.txt
+        regexp: 'cgroup_disable=memory'
+        replace: ''
 
-      - name: Install k3s in Master Node
-        shell: |
-                curl -sfL https://get.k3s.io | sh -
-                kubectl get nodes
-        become: true
-        become_method: sudo
+    - name: Ensure cgroup_enable=cpuset is present in cmdline.txt
+      lineinfile:
+        path: /boot/firmware/cmdline.txt
+        line: "cgroup_enable=cpuset"
+        state: present
+        insertafter: EOF
 
-  - name: Gather IP and Node Token from Master Node 
-    hosts: masternode
-    gather_facts: no
+    - name: Ensure cgroup_memory=1 is present in cmdline.txt
+      lineinfile:
+        path: /boot/firmware/cmdline.txt
+        line: "cgroup_memory=1"
+        state: present
+        insertafter: EOF
 
-    tasks:
-      - name: Get the IP of Master Node
-        shell: hostname -I | awk '{print$1}'
-        register: masterIP
+    - name: Ensure cgroup_enable=memory is present in cmdline.txt
+      lineinfile:
+        path: /boot/firmware/cmdline.txt
+        line: "cgroup_enable=memory"
+        state: present
+        insertafter: EOF
+      notify: Reboot if cgroup params changed
 
-      - name: Get the Node Token value from the Master
-        shell: cat /var/lib/rancher/k3s/server/node-token
-        become: true
-        become_method: sudo
-        register: nodeToken
-      
-      - name: Add to a dummy host
-        add_host:
-          name: "K3s_MASTER_DETAILS"
-          masterip: "{{ masterIP.stdout }}"
-          nodetoken: "{{ nodeToken.stdout }}"
-      
-  - name: Install K3s in Worker nodes
-    hosts: workers
-    tasks: 
-      - name: Installing K3s agents
-        shell: curl -sfL https://get.k3s.io | K3S_URL=https://{{ hostvars['K3s_MASTER_DETAILS']['masterip'] }}:6443 K3S_TOKEN={{ hostvars['K3s_MASTER_DETAILS']['nodetoken'] }} sh -
+    - name: Check current kernel cmdline
+      shell: cat /proc/cmdline
+      register: proc_cmdline
+      changed_when: false
+
+    - name: Display current kernel command line
+      debug:
+        msg: "Current kernel cmdline: {{ proc_cmdline.stdout }}"
+
+    - name: Check memory cgroup status
+      shell: cat /proc/cgroups | grep memory || echo "memory cgroup not found"
+      register: memory_cgroup_status
+      changed_when: false
+      failed_when: false
+
+    - name: Display memory cgroup status
+      debug:
+        msg: "Memory cgroup status: {{ memory_cgroup_status.stdout }}"
+
+    - name: Fail if cgroup parameters not found in kernel cmdline
+      fail:
+        msg: |
+          Cgroup parameters not found in /proc/cmdline. Manual intervention required.
+          Current cmdline: {{ proc_cmdline.stdout }}
+          Expected parameters: cgroup_enable=cpuset cgroup_memory=1 cgroup_enable=memory
+      when: "'cgroup_enable=cpuset' not in proc_cmdline.stdout or 'cgroup_memory=1' not in proc_cmdline.stdout or 'cgroup_enable=memory' not in proc_cmdline.stdout"
+
+  handlers:
+    - name: Reboot if cgroup params changed
+      reboot:
+        msg: "Rebooting after cgroup configuration change"
+        pre_reboot_delay: 5
+        reboot_timeout: 600
+
+- name: Master Node Configuration
+  hosts: masternode
+  gather_facts: no
+  become: true
+
+  tasks:
+    - name: Ensure iptables is installed
+      apt:
+        name: iptables
+        state: present
+      become: true
+
+    - name: Check if 10250 is Opened
+      wait_for:
+        port: 10250
+        delay: 5
+        timeout: 10
+        msg: "10250 is not open"
+      register: port_check
+      ignore_errors: yes
+
+    - name: Open port 10250 in iptables
+      shell: iptables -A INPUT -p tcp --dport 10250 -j ACCEPT
+      when: port_check.failed == true
+
+    - name: Print message if 10250 is Already Opened
+      debug:
+        msg: "10250 is already Opened"
+      when: port_check.failed == false
+
+    - name: Install k3s in Master Node
+      shell: |
+        curl -sfL https://get.k3s.io | sh -
+        kubectl get nodes
+
+- name: Gather IP and Node Token from Master Node
+  hosts: masternode
+  gather_facts: no
+  become: true
+
+  tasks:
+    - name: Get the IP of Master Node
+      shell: hostname -I | awk '{print$1}'
+      register: masterIP
+
+    - name: Get the Node Token value from the Master
+      shell: cat /var/lib/rancher/k3s/server/node-token
+      register: nodeToken
+
+    - name: Add to a dummy host
+      add_host:
+        name: "K3s_MASTER_DETAILS"
+        masterip: "{{ masterIP.stdout }}"
+        nodetoken: "{{ nodeToken.stdout }}"
+
+- name: Install K3s in Worker nodes
+  hosts: workers
+  become: true
+
+  tasks:
+    - name: Installing K3s agents
+      shell: curl -sfL https://get.k3s.io | K3S_URL=https://{{ hostvars['K3s_MASTER_DETAILS']['masterip'] }}:6443 K3S_TOKEN={{ hostvars['K3s_MASTER_DETAILS']['nodetoken'] }} sh -
